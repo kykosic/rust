@@ -2,6 +2,8 @@ extern crate curl;
 extern crate flate2;
 extern crate pkg_config;
 extern crate semver;
+extern crate serde;
+extern crate serde_xml_rs;
 extern crate tar;
 
 use std::env::{
@@ -10,7 +12,7 @@ use std::env::{
 };
 use std::error::Error;
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 
@@ -18,6 +20,8 @@ use curl::easy::Easy;
 #[cfg(not(target_env = "msvc"))]
 use flate2::read::GzDecoder;
 use semver::Version;
+use serde::Deserialize;
+use serde_xml_rs::from_reader;
 #[cfg(not(target_env = "msvc"))]
 use tar::Archive;
 #[cfg(target_env = "msvc")]
@@ -29,8 +33,9 @@ const REPOSITORY: &'static str = "https://github.com/tensorflow/tensorflow.git";
 const FRAMEWORK_TARGET: &'static str = "tensorflow:libtensorflow_framework";
 const TARGET: &'static str = "tensorflow:libtensorflow";
 // `VERSION` and `TAG` are separate because the tag is not always `'v' + VERSION`.
-const VERSION: &'static str = "1.15.0";
-const TAG: &'static str = "v1.15.0";
+// `VERSION` is not currently used for nightly builds
+// const VERSION: &'static str = "1.15.0";
+const TAG: &'static str = "v2.2.0";
 const MIN_BAZEL: &'static str = "0.5.4";
 
 macro_rules! get(($name:expr) => (ok!(env::var($name))));
@@ -139,9 +144,65 @@ fn extract<P: AsRef<Path>, P2: AsRef<Path>>(archive_path: P, extract_to: P2) {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ListBucketResult {
+    contents: Vec<BucketObject>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct BucketObject {
+    key: String,
+    generation: u64,
+}
+
+// Get the URL for the latest pre-compiled nightly C lib on this system
+fn get_latest_nightly_url(os: &str, proc_type: &str, ext: &str) -> String {
+    let filename = format!(
+        "libtensorflow-{}-{}-{}{}",
+        proc_type,
+        os,
+        env::consts::ARCH,
+        ext
+    );
+    log_var!(filename);
+
+    // Fetch available builds from storage
+    let base_url = "https://storage.googleapis.com/libtensorflow-nightly";
+    let mut res = Vec::new();
+    let mut easy = Easy::new();
+    easy.url(&base_url).unwrap();
+    {
+        let mut transfer = easy.transfer();
+        transfer
+            .write_function(|data| {
+                res.extend_from_slice(data);
+                Ok(data.len())
+            })
+            .unwrap();
+        transfer.perform().unwrap();
+    }
+    let parsed: ListBucketResult = from_reader(&res[..]).unwrap();
+
+    // Find latest one matching filename
+    let mut objs = parsed
+        .contents
+        .iter()
+        .filter(|obj| obj.key.ends_with(&filename))
+        .collect::<Vec<_>>();
+    objs.sort_by_key(|obj| obj.generation);
+    format!(
+        "{}/{}",
+        base_url,
+        objs.last()
+            .unwrap_or_else(|| panic!("Unable to find nightly build for system"))
+            .key
+    )
+}
+
 // Downloads and unpacks a prebuilt binary. Only works for certain platforms.
 fn install_prebuilt() {
-    // Figure out the file names.
     let os = match env::consts::OS {
         "macos" => "darwin",
         x => x,
@@ -155,14 +216,8 @@ fn install_prebuilt() {
     let ext = ".zip";
     #[cfg(not(target_env = "msvc"))]
     let ext = ".tar.gz";
-    let binary_url = format!(
-        "https://storage.googleapis.com/tensorflow/libtensorflow/libtensorflow-{}-{}-{}-{}{}",
-        proc_type,
-        os,
-        env::consts::ARCH,
-        VERSION,
-        ext
-    );
+
+    let binary_url = get_latest_nightly_url(os, proc_type, ext);
     log_var!(binary_url);
     let short_file_name = binary_url.split("/").last().unwrap();
     let mut base_name = short_file_name.to_string();
